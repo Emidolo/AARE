@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.usb.UsbAccessory
@@ -19,6 +21,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -79,6 +82,8 @@ class ProjectionService : Service() {
     private var projection: MediaProjection? = null
     private var usbAccessory: UsbAccessory? = null
     private var usbRetries = 0
+    /** Waiting on the system's USB permission dialog for this accessory. */
+    private var usbPermissionPending: UsbAccessory? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wirelessJob: Job? = null
     /** onDestroy ran: a session closing late must not touch this instance any more. */
@@ -92,6 +97,7 @@ class ProjectionService : Service() {
         certs = CertificateStore(this)
         media = MediaHub(this, scope)
         createChannel()
+        ContextCompat.registerReceiver(this, usbPermission, IntentFilter(ACTION_USB_PERMISSION), ContextCompat.RECEIVER_NOT_EXPORTED)
         _state.update { it.copy(running = true) }
     }
 
@@ -114,6 +120,7 @@ class ProjectionService : Service() {
         destroyed = true
         // Pending retries and idle checks would run on a dead instance.
         main.removeCallbacksAndMessages(null)
+        runCatching { unregisterReceiver(usbPermission) }
         wirelessJob?.cancel()
         // The session closes up to a second later; forget it first so its onEnded is ignored.
         val s = session
@@ -217,9 +224,34 @@ class ProjectionService : Service() {
     private fun openUsb(accessory: UsbAccessory) {
         usbAccessory = accessory
         val usb = getSystemService(UsbManager::class.java)
+        if (!usb.hasPermission(accessory)) {
+            // Some phones (Samsung) don't grant it on attach: ask, and usbPermission comes back here.
+            if (usbPermissionPending == null) {
+                usbPermissionPending = accessory
+                log("USB: asking for permission to the accessory")
+                // Mutable so the system can add EXTRA_PERMISSION_GRANTED; explicit (package) as Android 14+ requires.
+                val flags = PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0)
+                usb.requestPermission(accessory, PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION).setPackage(packageName), flags))
+            }
+            return
+        }
         val transport = runCatching { UsbAccessoryTransport(usb, accessory) }
             .onFailure { log("USB: ${it.message}") }.getOrNull() ?: return
         startSession(transport, wireless = false, peerKey = usbPeerKey(accessory), trustOnFirstUse = false)
+    }
+
+    private val usbPermission = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val acc = usbPermissionPending ?: return
+            usbPermissionPending = null
+            if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                openUsb(acc)
+            } else {
+                log("USB: permission to the accessory denied")
+                usbAccessory = null
+                scheduleIdleStop()
+            }
+        }
     }
 
     /**
@@ -412,7 +444,7 @@ class ProjectionService : Service() {
     }
 
     /** Nothing to keep the service for. A held screen-capture consent counts: it can't be given again silently. */
-    private fun idle() = session == null && tcpServer == null && wirelessJob?.isActive != true && projection == null
+    private fun idle() = session == null && usbPermissionPending == null && tcpServer == null && wirelessJob?.isActive != true && projection == null
 
     private fun stopEverything() {
         // No USB reconnect after this: the session's onEnded may come after the stop.
@@ -431,6 +463,7 @@ class ProjectionService : Service() {
         private const val CHANNEL = "connection"
         private const val NOTIFICATION_ID = 1
         const val ACTION_USB = "net.prototux.aare.USB"
+        private const val ACTION_USB_PERMISSION = "net.prototux.aare.USB_PERMISSION"
         const val ACTION_IDLE = "net.prototux.aare.IDLE"
         const val ACTION_STOP = "net.prototux.aare.STOP"
         const val ACTION_WIRELESS = "net.prototux.aare.WIRELESS"

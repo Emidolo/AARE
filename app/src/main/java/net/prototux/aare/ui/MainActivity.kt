@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbManager
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -130,6 +131,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         applyDebugExtras(intent)
+        askUsbPermissionIfNeeded()
         setContent { PhoneTheme(dark = isSystemInDarkTheme()) { Surface(Modifier.fillMaxSize()) { Home() } } }
     }
 
@@ -143,6 +145,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** A head unit already in accessory mode but not granted (Samsung): the service asks for permission. */
+    private fun askUsbPermissionIfNeeded() {
+        val usb = getSystemService(UsbManager::class.java) ?: return
+        usb.accessoryList?.firstOrNull { it.manufacturer == "Android" && it.model in USB_HEAD_UNIT_MODELS }
+            ?.takeIf { !usb.hasPermission(it) }
+            ?.let { ProjectionService.startUsb(this, it) }
+    }
+
     /** Debug builds only: lets ./headunit.sh switch the head unit server on over adb. Returns true if applied. */
     private fun applyDebugExtras(intent: Intent?): Boolean {
         if (!net.prototux.aare.BuildConfig.DEBUG || intent?.hasExtra("hu_server") != true) return false
@@ -150,6 +160,9 @@ class MainActivity : ComponentActivity() {
         return true
     }
 }
+
+/** Same as res/xml/accessory_filter.xml. */
+private val USB_HEAD_UNIT_MODELS = setOf("Android Auto", "Android Open Automotive Protocol")
 
 /** The settings pages, Android Auto style: one per topic, opened from the home page. */
 private enum class Page(val titleRes: Int, val subtitleRes: Int, val icon: ImageVector) {
